@@ -54,11 +54,7 @@ def make_validate_response(nano_model):
     async def validate_response(request: ModelRequest, handler):
         ai = await handler(request)
 
-        # Only validate in RAG-heavy steps.
         state = request.state
-        step = state.get("current_step")
-        if step not in {"tech_support", "product_qna"}:
-            return ai
 
         # Only validate plain assistant text replies (no pending tool calls).
         if not isinstance(ai, AIMessage) or getattr(ai, "tool_calls", None):
@@ -67,14 +63,19 @@ def make_validate_response(nano_model):
         if not _looks_like_factual(text):
             return ai
 
-        retrieved = state.get("last_retrieved_docs") or []
+        # If the reply doesn't make doc-id citations at all, we treat it as a
+        # generic / conversational reply and let it through. Groundedness only
+        # bites when the model SOUNDS factual but lacks a real citation.
         cited_ids = set(_DOC_TAG.findall(text))
-        if cited_ids and any(c in retrieved for c in cited_ids):
-            # Already cites a real retrieved doc — pass.
+        retrieved = set(state.get("last_retrieved_docs") or [])
+        if not cited_ids:
+            return ai
+        if cited_ids & retrieved:
+            # At least one citation matches a doc-id the kb specialist actually returned.
             return ai
 
         if VALIDATION_MODE == "advisory":
-            logger.warning("Ungrounded answer detected (step=%s). Logging only.", step)
+            logger.warning("Ungrounded answer detected. Logging only.")
             return ai
 
         # REWRITE (default) or ESCALATE — replace the model's text. Step

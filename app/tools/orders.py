@@ -62,26 +62,25 @@ def lookup_order(
 
 @tool
 def list_my_orders(
+    customer_id: int,
     runtime: ToolRuntime[None, SupportState],
     tool_call_id: Annotated[str, InjectedToolCallId],
     limit: int = 5,
 ) -> Command:
-    """List the most recent orders for the currently signed-in customer.
+    """List the most recent orders for the given customer_id.
 
-    Use this whenever the customer asks about "my order(s)" but hasn't given
-    an order id. Reads `customer_id` from the conversation state.
+    The caller (the orders subagent in the supervisor design) MUST pass
+    customer_id explicitly — there is no shared parent state to read from.
     """
     data = _data(runtime)
     if data is None:
         return Command(
             update={"messages": [ToolMessage("Orders not loaded.", tool_call_id=tool_call_id)]}
         )
-    state = getattr(runtime, "state", None) or {}
-    customer_id = state.get("customer_id") if isinstance(state, dict) else None
     if customer_id is None:
         return Command(
             update={"messages": [ToolMessage(
-                "I don't know which customer this is. Ask the customer for their order id or email.",
+                "MISSING: customer_id",
                 tool_call_id=tool_call_id,
             )]}
         )

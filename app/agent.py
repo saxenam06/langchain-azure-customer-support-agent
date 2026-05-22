@@ -1,12 +1,7 @@
-"""Build the LangChain v1 customer-support agent.
+"""Thin facade: build the lead agent.
 
-`build_agent` is called once from the Starlette lifespan. It assembles:
-  - A main `ChatOpenAI(use_responses_api=True)` model for the support driver.
-  - A cheap `gpt-5-nano` model for refine + validate + summarisation.
-  - All tools from `app.tools.ALL_TOOLS`.
-  - Middleware: refine_query, apply_step_config (handoffs), validate_response,
-    SummarizationMiddleware.
-  - InMemorySaver checkpointer.
+Models are created once at startup. The lead's middleware stack and the worker
+subagents are wired in `app/agents/lead.py`.
 """
 
 from __future__ import annotations
@@ -15,17 +10,10 @@ import logging
 import os
 
 from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
-from langchain.agents import create_agent
-from langchain.agents.middleware import SummarizationMiddleware
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
 
+from app.agents.lead import build_lead
 from app.data_loader import AppData
-from app.middleware import apply_step_config
-from app.middleware.refine import make_refine_query
-from app.middleware.validate import make_validate_response
-from app.state import SupportState
-from app.tools import ALL_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +26,8 @@ def _aoai_v1_endpoint() -> str:
 
 
 def build_models() -> tuple[ChatOpenAI, ChatOpenAI, DefaultAzureCredential]:
-    """Create the main (gpt-5.4-mini drives the main agent) + nano models (used for middleware tasks)."""
+    """Create the main + nano models. Main drives the lead; nano drives every subagent
+    and the refine/validate/summarise middleware utilities."""
     credential = DefaultAzureCredential()
     token_provider = get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")
     base_url = _aoai_v1_endpoint()
@@ -56,35 +45,15 @@ def build_models() -> tuple[ChatOpenAI, ChatOpenAI, DefaultAzureCredential]:
         api_key=token_provider,
         streaming=False,
         use_responses_api=True,
-        # Tag every nano call so the chat UI can filter its tokens out of
-        # the visible bubble (refine/validate output is internal-only).
+        # Tag every nano call so the streamer can drop it from the user-facing bubble.
         tags=["nano-utility"],
     )
     return main, nano, credential
 
 
 def build_agent(main_model: ChatOpenAI, nano_model: ChatOpenAI):
-    """Compile the customer-support agent."""
-
-    # makes user queries more explicit
-    refine_query = make_refine_query(nano_model)
-    # checks agent response is grounded in data
-    validate_response = make_validate_response(nano_model)
-    #summarises conversation when it exceeds token limit to preserve context while keeping within model limits
-    summariser = SummarizationMiddleware(model=nano_model, max_tokens_before_summary=4000)
-
-    return create_agent(
-        model=main_model,
-        tools=ALL_TOOLS,
-        state_schema=SupportState,
-        middleware=[
-            refine_query,
-            apply_step_config,
-            validate_response,
-            summariser,
-        ],
-        checkpointer=InMemorySaver(),
-    )
+    """Compile the lead (orchestrator) agent + initialise specialist subagents."""
+    return build_lead(main_model, nano_model)
 
 
 __all__ = ["build_agent", "build_models", "AppData"]

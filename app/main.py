@@ -123,7 +123,6 @@ async def chat(request):
         yield event({"thread_id": thread_id})
 
         full_text: list[str] = []
-        last_step: str | None = None
         emitted_doc_ids: set[str] = set()
         # Per-message dedupe: LangGraph can emit both streaming token deltas
         # AND a final aggregated chunk with the full cumulative text for the
@@ -149,16 +148,10 @@ async def chat(request):
                 if "nano-utility" in tags:
                     continue
 
-                # Surface step transitions from the per-chunk metadata.
-                cur_step = None
-                if isinstance(metadata, dict):
-                    cur_step = metadata.get("current_step") or metadata.get("langgraph_node")
-                if cur_step and cur_step != last_step and cur_step in {
-                    "triage", "order_lookup", "returns",
-                    "tech_support", "product_qna", "resolution",
-                }:
-                    last_step = cur_step
-                    yield event({"step": cur_step})
+                # Supervisor architecture has no step machine — we no longer
+                # emit {"step": ...} events. The debug drawer can derive
+                # "which specialist" from the {"tool": ...} events below
+                # (delegate tool names: ask_orders_specialist, etc.).
 
                 for ev in iter_message_events(msg):
                     if ev["kind"] == "text":
@@ -210,7 +203,6 @@ async def chat(request):
         yield event({
             "done": True,
             "message": "".join(full_text),
-            "step": last_step,
             "thread_id": thread_id,
         })
 
