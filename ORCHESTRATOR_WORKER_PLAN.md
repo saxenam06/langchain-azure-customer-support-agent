@@ -1094,3 +1094,428 @@ The six examples together cover every pattern in §1 ("Where handoffs breaks dow
 | Honest gaps (no KB match) | SW04, SW05 |
 | Policy-window arithmetic | SW03 (7-day kb-009), SW04/SW06 (30-day returns) |
 | Compound intents | SW06 |
+
+## 13. Worked traces — CodeBeamer-style slot-fill on Zava data
+
+Two queries on the Zava dataset that produce a trace with the same shape as the canonical CodeBeamer example:
+
+> *"I'm testing test case ID 1497473 and got additional error codes during execution: EH_EC_INVTEMP_CUTOFF, EH_EC_INVTEMP_CUTOFFSIL, EH_EC_PWRSWITCHDRVR_POWERSUPPLY_FAULT."*
+
+That trace's key features are:
+- User references one ID + reports observed behavior in the same message.
+- Lead recognises which schema fields are partially filled.
+- Lead delegates to the right specialist to look up authoritative info about the referenced ID.
+- Specialist composes multiple internal tool calls (resolve ID → fetch details → map sub-IDs to names) and proactively returns related context.
+- Lead synthesises actual vs expected, identifies remaining gaps, asks the user only what no source can answer.
+
+The two Zava analogs below produce that exact shape on the data already in the repo.
+
+### Trace map: CodeBeamer concept → Zava analog
+
+| CodeBeamer | Zava (this trace) |
+|---|---|
+| Test case ID `1497473` | Order ID (e.g. `#87`) or SKU |
+| Observed error codes `EH_EC_*` | Observed symptoms in the user's words (motor cuts out, chuck won't lock, battery hot) |
+| Test case description (CodeBeamer fetch) | KB articles + product spec + warranty terms |
+| Expected error codes from test description | Expected behavior grounded in KB + warranty |
+| Map error code IDs → names (extra MCP call) | Map `product_id` → SKU → product name via orders + catalog |
+| CodeBeamer specialist | Combination of orders + catalog + kb specialists |
+| Mismatch between expected and observed | Drives `category`, `severity`, and `referenced_doc_ids` on the ticket |
+
+### SW07 — Order-referenced defect with multi-symptom report
+
+**Query:** *"I'm using the drill I bought in order #87 and it's behaving weird — the motor cuts out after about 2 minutes, the chuck won't lock onto bits, and the battery feels really hot when this happens."*
+
+#### Turn 1: Lead's SCAN + ENRICH + PLAN
+
+Lead's mental classification of the user's message against `ZavaSupportTicket`:
+
+| Field | Status from this message |
+|---|---|
+| `actual_behavior` | FILLED — "motor cuts out after 2 min, chuck won't lock, battery hot during use" |
+| `observed_symptoms` | FILLED — `["motor cuts out after ~2 min", "chuck won't lock", "battery hot"]` |
+| `order_id` | FILLED — 87 |
+| `product_name` | PARTIAL — "drill" (need order lookup to disambiguate which drill) |
+| `reproduction_steps` | PARTIAL — "during use" (specifics missing) |
+| `customer_id`, `customer_email` | depends on UI dropdown / state |
+| `product_sku`, `item_index`, `purchase_date` | EMPTY — system-knowable via orders specialist |
+| `expected_behavior`, `referenced_doc_ids` | EMPTY — system-knowable via kb specialist (NOT user opinion) |
+| `warranty_status` | EMPTY — system-knowable via catalog specialist |
+| `severity` | HINT — "battery hot" suggests potential safety concern, lean high |
+| `category` | HINT — likely `warranty_claim` |
+| `additional_context` | EMPTY — user-knowable, ask at the end |
+
+PLAN: two independent delegations can run in parallel — orders (to resolve the drill identity) and kb (to ground expected behavior). Catalog will follow once SKU is known.
+
+#### Turn 1 delegations (parallel)
+
+**Delegation 1:** `ask_orders_specialist`
+
+```
+Goal: For order #87, find the drill line item. Return its item_index,
+product_id, SKU, product_name, unit_price, and the order_date.
+Known facts: order_id=87
+```
+
+Orders specialist composes:
+- `lookup_order(87)` → full order with all items (specialist has all this in hand)
+- Picks the drill from the items list by category match
+
+Specialist reply:
+```
+Order 87 (placed 2025-04-11, status=DELIVERED, customer_id=22): the drill is
+at item_index=0 — product_id=9, SKU PTDR018000, "Cordless Drill 18V Li-Ion",
+unit_price $189.99.
+
+Related context:
+  - Order also contains item_index=1: "Hammer Drill 1/2-inch" (SKU PTHD000050,
+    POWER TOOLS, $159.99) — not the one the user mentioned.
+  - order_date 2025-04-11 → ~13 months ago, outside the 30-day return window
+    but well inside any 24-month warranty.
+  - Order total $349.98.
+```
+
+**Delegation 2 (parallel):** `ask_kb_specialist`
+
+```
+Goal: Find help-center articles covering a cordless drill where the motor cuts
+out during use, the chuck fails to lock onto bits, and the battery gets
+unusually hot. We need the [doc_id] tags for ticket citations.
+Known facts: (none required)
+```
+
+KB specialist composes:
+- `search_help_center("cordless drill motor cuts out chuck wont lock battery overheat")` (one focused search)
+- Reads ALL returned hits — judges by content, not rank
+
+Specialist reply:
+```
+Primary matches by content:
+  [kb-003] Drill not turning on — troubleshooting checklist. Battery seated and
+  charged, lock-off button unlocked, contacts clean, switch position. "If none
+  of these resolve the issue, the tool may be defective and is covered under
+  our 2 year power-tool warranty."
+  [kb-006] Battery care and storage. "Lithium-ion batteries last longest when
+  stored at 30–50% charge in a cool dry place... Never leave a battery on the
+  charger long-term. Replace if it no longer holds a charge — most Zava
+  batteries are warranted for 2 years from purchase."
+
+Related context:
+  [kb-004] How to file a warranty claim — needed if kb-003 troubleshooting
+  doesn't resolve. "Hand tools have lifetime warranty; power tools have a
+  2-year limited warranty; consumables are not covered."
+```
+
+#### Turn 2: Lead's next SCAN + ENRICH + PLAN
+
+Lead now has (filled this turn):
+- `product_sku` = `PTDR018000`, `product_name` = `Cordless Drill 18V Li-Ion`, `item_index` = 0, `purchase_date` = `2025-04-11`, `customer_id` = 22
+- `referenced_doc_ids` = `[kb-003, kb-006]` (kb-004 in reserve for related context)
+- `expected_behavior` — grounded in kb-003 + kb-006: drill should run continuously under normal use; the kb-003 checklist defines the expected non-defective state; kb-006 sets battery lifetime expectations.
+
+Still empty:
+- `warranty_status` → next delegate (catalog).
+- `customer_email` → need to ask user OR use lookup-by-email if user gave one (this trace assumes UI dropdown set both customer_id and customer_email).
+- `reproduction_steps` (more specific), `additional_context`, final `severity` and `category` confirmations — user-knowable, batch at the end.
+
+PLAN: one more delegation (catalog), then final batched question to user.
+
+#### Turn 2 delegation
+
+**Delegation 3:** `ask_catalog_specialist`
+
+```
+Goal: What is the warranty for SKU PTDR018000 (Cordless Drill 18V Li-Ion)?
+Quote the exact months, every covered defect, every exclusion, and the
+product category.
+Known facts: sku=PTDR018000
+```
+
+Catalog specialist composes:
+- `check_warranty("PTDR018000")` → returns full warranty terms
+
+Specialist reply:
+```
+PTDR018000 (Cordless Drill 18V Li-Ion) — category POWER TOOLS — 24-month warranty.
+Covered defects: motor failure, switch failure, gearbox failure.
+Exclusions: consumables (blades, bits); battery (separate 24-month warranty);
+drop damage.
+
+Related context:
+  - The reported symptoms split across two warranty regimes:
+      * motor cuts out + chuck won't lock → POWER TOOLS 24-month (covered).
+      * battery overheats → separate 24-month battery warranty (covered, but
+        a distinct claim).
+  - Category POWER TOOLS commonly maps to affected_components: motor /
+    switch / gearbox / battery subsystems.
+```
+
+#### Turn 3: Lead's final batch question to user
+
+Lead has now resolved every system-knowable field. What remains is purely user-knowable:
+
+- `reproduction_steps` — more specific (every time? only under load? specific bit size?)
+- `severity` confirmation — the lead's hint is "high" because of battery heat; needs user confirmation
+- `additional_context` — anything else worth recording
+
+Per the pacing rule (1–3 user-knowable slots left), batch:
+
+> *Lead → user:* "Thanks — I have what I need from our records. Before I file the ticket, three quick things: (1) Does the motor cut out every time you use it, or only under load (drilling into hard material)? (2) Is the battery actually too hot to comfortably touch — that's a safety concern I want to flag clearly. (3) Anything else useful I should include?"
+>
+> *User:* "Every time, even drilling pine. Battery is hot but not burning, more like uncomfortably warm. Nothing else."
+
+#### Turn 4: Lead composes and submits
+
+```python
+create_support_ticket(ticket=ZavaSupportTicket(
+    customer_id=22,
+    customer_email="<from state>",
+    product_sku="PTDR018000",
+    product_name="Cordless Drill 18V Li-Ion",
+    order_id=87,
+    item_index=0,
+    purchase_date="2025-04-11",
+    symptom_summary="Cordless Drill 18V Li-Ion fails during normal use: motor cuts out after ~2 min, chuck won't lock onto bits, battery runs uncomfortably warm.",
+    observed_symptoms=[
+        "motor cuts out after ~2 minutes of use",
+        "chuck won't lock onto bits",
+        "battery becomes uncomfortably warm during operation",
+    ],
+    expected_behavior=(
+        "Per kb-003, a non-defective drill should run continuously and respond to a "
+        "properly seated chuck; per kb-006, lithium-ion batteries should not run "
+        "uncomfortably warm under normal load and are covered by a separate 24-month "
+        "battery warranty."
+    ),
+    referenced_doc_ids=["kb-003", "kb-006", "kb-004"],
+    warranty_status="covered",   # POWER TOOLS 24mo + separate battery warranty
+    actual_behavior="Motor cuts out after ~2 minutes EVERY time, including light loads (pine). Chuck fails to lock onto bits. Battery becomes uncomfortably warm but not burning.",
+    reproduction_steps="Charge battery, attach bit, drill into soft pine — motor cuts out around 2-minute mark every time.",
+    additional_context="Symptoms span two warranty regimes (POWER TOOLS for motor/chuck, separate battery warranty for the heat). Lead recommends both be investigated.",
+    severity="medium",   # not safety_critical (battery warm, not burning) but high impact on tool usability
+    category="warranty_claim",
+))
+```
+
+`HumanInTheLoopMiddleware` intercepts, shows the customer the full structured ticket, and submits only on approval.
+
+#### Trace shape vs CodeBeamer original
+
+| Step | CodeBeamer original | This Zava trace |
+|---|---|---|
+| User reports actual + references an ID | "Testing TC 1497473 got error codes EH_EC_*" | "Drill from order #87, motor cuts out, chuck won't lock, battery hot" |
+| Lead identifies which fields the message touches | actual_behavior, observed_codes, test_cases | actual_behavior, observed_symptoms, order_id, partial product_name |
+| Lead recognises target_behavior must come from docs | "fetch test case description, see expected error codes" | "look up KB + warranty for expected drill/battery behavior" |
+| Specialist composes internal tool calls + maps IDs → names | CB MCP: get description → map error code IDs → names | Orders: lookup_order → map product_id → SKU → product name |
+| Specialist proactively returns related context | "by the way, this test case is owned by team X" | "by the way, order also has a Hammer Drill (not the one reported); 13 months past 30-day return window but inside 24-month warranty" |
+| Lead synthesises actual vs expected | error codes seen vs expected | observed symptoms vs kb-003/kb-006 expectations |
+| Lead asks final 1–2 questions to user | residual user-only fields | every time vs under load; how hot is "hot"; anything else |
+| Ticket submitted with all fields filled | structured ticket | structured ZavaSupportTicket via Pydantic |
+
+### SW08 — Hand-tool defect with simpler shape (1 specialist round-trip)
+
+**Query:** *"I bought a Sledge Hammer 3lb in my last order and the head wobbled loose after two swings."*
+
+Same shape, fewer turns. Demonstrates that the same protocol scales down when the goal is simpler.
+
+#### Tool sequence
+
+1. `ask_orders_specialist`:
+   ```
+   Goal: For customer 10, list recent orders and find the one containing a
+   "Sledge Hammer 3lb". Return order_id, item_index, order_date, product_id,
+   SKU.
+   Known facts: customer_id=10
+   ```
+   Reply: *"Order 100, ordered 2025-01-14, status=DELIVERED. Sledge Hammer 3lb at item_index=0, SKU=HTSH000300, $29.99. Related context: order also contained Exterior Acrylic Paint at item_index=1. Order is 492 days old → past 30-day return window."*
+
+2. `ask_kb_specialist`:
+   ```
+   Goal: Help-center articles on hammer head coming loose. What's the repair vs
+   warranty-replacement policy? Include any related warranty-claim guidance.
+   ```
+   Reply: *"`[kb-007]` Hammer head loose on handle. Wood-handled hammers: drive a new metal wedge into the existing slot. Fiberglass-handled: epoxy bond has failed → return under lifetime warranty rather than repair. Related context: `[kb-004]` warranty claim process — order number + brief defect description; hand tools have lifetime warranty against manufacturing defects."*
+
+3. `ask_catalog_specialist`:
+   ```
+   Goal: Warranty for SKU HTSH000300 (Sledge Hammer 3lb). Quote exact months,
+   covered defects, exclusions, category.
+   Known facts: sku=HTSH000300
+   ```
+   Reply: *"HTSH000300 (Sledge Hammer 3lb) — category HAND TOOLS — 999-month (effectively lifetime) warranty. Covered: manufacturing defects, head separation, handle splitting. Excluded: normal wear, abuse, modification. Related context: handle construction (wood vs fiberglass) determines whether this is a wedge-repair fix (wood) or a warranty replacement (fiberglass) per kb-007 above. Category HAND TOOLS → affected_components: head, handle, wedge."*
+
+4. **Lead's final batch:** *"I have what I need. Two quick things: (1) Is the handle wood or fiberglass — that determines whether this is a quick wedge repair you can do yourself or a warranty replacement we ship. (2) Anything else useful?"*
+
+5. **Submit** `ZavaSupportTicket(..., warranty_status="lifetime", category="warranty_claim", referenced_doc_ids=["kb-007", "kb-004"], severity="low", ...)`.
+
+This trace is the slimmer version of the same pattern: lead identifies what the message gives it, asks specialists for everything authoritative, batches the user-only question at the end, submits a complete ticket.
+
+### SW09 — ID-to-name resolution inside a specialist (the closest CB analog)
+
+This trace exhibits the **specific** behavior from your CodeBeamer example where the spec stores a referenced thing as an ID, the user reports it by name, and the specialist must do ID → name mapping (via additional tool calls within its own subgraph) to corroborate before reporting back.
+
+**Query:** *"I'm having issues with the drill in my order #87 — it makes a high-pitched whine after a few minutes of use. What does your help center say about it, and is this covered under warranty?"*
+
+#### Why this is the closest analog
+
+| CodeBeamer behavior | Zava behavior in this trace |
+|---|---|
+| User says error codes by NAME (`EH_EC_*`) | User says product by NAME ("the drill") |
+| Test case description holds expected codes as IDs | Order items hold products as `product_id` integers (raw schema) |
+| CB specialist fetches description, sees IDs, makes ADDITIONAL MCP calls to resolve them to names | Orders specialist fetches the order, sees `product_id`s in raw items, **resolves each `product_id` → SKU → product_name** before reporting back |
+| Corroborate observed names vs resolved expected names | Confirm "the drill" the user meant is in fact `item_index=N` with the right product_name |
+| Specialist also volunteers context discovered along the way | Orders specialist surfaces other items in the order; KB specialist follows references inside a primary article to fetch a related one |
+
+#### Trace
+
+**Turn 1 — Lead delegation 1**
+
+```
+ask_orders_specialist(
+  goal="For order #87, find the drill the user means. The user said 'the drill' by name. "
+       "Return item_index, product_id, SKU, product_name (with the resolution from product_id "
+       "made explicit so we can corroborate), unit_price, purchase_date, and category. "
+       "If multiple drill items exist in this order, list ALL candidates so we can disambiguate.",
+  order_id=87,
+)
+```
+
+**Orders specialist reasoning + tool composition:**
+
+The specialist's first call returns the order, but the raw `items` array uses `product_id` integers — *no product names*. It is the specialist's responsibility to resolve each product_id (via the catalog mapping it has access to internally) to a SKU and a product_name. It does that resolution **before** replying so it can corroborate against the user's word "drill."
+
+**Orders specialist reply:**
+
+```
+Order 87 (placed 2025-04-11, status DELIVERED, customer_id=22) — one drill candidate matched:
+
+  - item_index=0: product_id=9 → SKU "PTDR018000" → "Cordless Drill 18V Li-Ion"
+    (resolved via products_by_id), unit_price $189.99, category POWER TOOLS.
+
+No other drill products in this order. Single match — no disambiguation needed.
+
+Related context:
+  - Order also contains item_index=1: product_id=10 → SKU "PTHD000050" → "Hammer Drill 1/2-inch"
+    (POWER TOOLS, $159.99). NOT the item the user referenced (they said "drill", not
+    "hammer drill"), but flagging in case the lead later needs warranty cross-reference
+    — same warranty regime applies.
+  - Resolution note: I had to resolve product_id 9 → product_name explicitly because the
+    order's raw items array only stores product_id. If the user's report had said "the
+    hammer drill" or "the cordless one", the same resolution step would have produced
+    item_index=1 as the match instead.
+  - order_date 2025-04-11 → ~13 months ago, outside the 30-day return window but inside
+    any 24-month warranty.
+```
+
+The "Resolution note:" line makes the ID→name reasoning visible to the lead and to any human reading the trace later — same role as a CodeBeamer specialist explicitly stating "I resolved error code ID 4471 → name EH_EC_INVTEMP_CUTOFF before corroborating."
+
+**Turn 1 — Lead delegation 2 (parallel)**
+
+```
+ask_kb_specialist(
+  goal="Help-center articles covering a cordless drill that develops a high-pitched whine "
+       "after a few minutes of use. Include any related articles on warranty-claim process "
+       "if a primary article references warranty.",
+)
+```
+
+**KB specialist reasoning + tool composition:**
+
+Search returns several hits. The specialist reads them by content, not by rank, and discovers that **no article directly covers "whine" symptoms**. The closest is `kb-003` (drill not turning on — troubleshooting), which mentions warranty coverage but doesn't explain the claim process. The specialist follows that reference and pulls `kb-004` proactively — same pattern as a CodeBeamer worker fetching the names for IDs mentioned inside the primary doc.
+
+**KB specialist reply:**
+
+```
+No help-center article directly covers "high-pitched whine" symptoms in a cordless drill.
+Closest by content (NOT by top rank — judged article-by-article):
+
+  [kb-003] Drill not turning on — troubleshooting checklist (battery seated, lock-off,
+  contacts, switch position). Only tangentially relevant: doesn't address abnormal
+  sounds, but notes: "If none of these resolve the issue, the tool may be defective
+  and is covered under our 2 year power-tool warranty."
+
+Related context:
+  - kb-003 REFERENCES warranty without explaining the claim process. Pulled [kb-004] for
+    completeness: "you'll need your order number and a brief description of the defect.
+    Hand tools have a lifetime warranty against manufacturing defects; power tools have
+    a 2 year limited warranty; consumables (blades, drill bits) are not covered."
+  - [kb-006] Battery care — not relevant to a whine symptom; excluded.
+  - [kb-010] Saw safety basics — not relevant; excluded.
+  - Honest assessment: the lead should flag in the ticket that no KB article matched
+    the whine symptom directly; this may suggest a defect the KB doesn't cover yet.
+```
+
+**Turn 2 — Lead delegation 3 (sequential, needs SKU from Turn 1)**
+
+```
+ask_catalog_specialist(
+  goal="Warranty for SKU PTDR018000 (Cordless Drill 18V Li-Ion). Quote exact months, every "
+       "covered defect, every exclusion, and the category.",
+  sku="PTDR018000",
+)
+```
+
+**Catalog specialist reply:**
+
+```
+PTDR018000 (Cordless Drill 18V Li-Ion) — category POWER TOOLS — 24-month warranty.
+Covered defects: motor failure, switch failure, gearbox failure.
+Exclusions: consumables (blades, bits); battery (separate 24-month warranty); drop damage.
+
+Related context:
+  - The "high-pitched whine" symptom is most likely a motor or gearbox issue — both are
+    explicitly covered_defects on this category. The lead can confidently set
+    warranty_status=covered and category=warranty_claim.
+  - Category POWER TOOLS typically maps to affected_components: motor, switch, gearbox,
+    chuck assembly.
+```
+
+**Turn 3 — Lead's final batch to user**
+
+> *"I have what I need from our records. Two quick things before I file: (1) Does the whine happen every time you use it, or only under load (e.g. drilling into hard material)? (2) Anything else useful I should include — strange smells, vibration, when it started?"*
+
+**Turn 4 — Lead submits**
+
+```python
+create_support_ticket(ticket=ZavaSupportTicket(
+    customer_id=22,
+    customer_email="<from state>",
+    product_sku="PTDR018000",
+    product_name="Cordless Drill 18V Li-Ion",
+    order_id=87,
+    item_index=0,
+    purchase_date="2025-04-11",
+    symptom_summary="Cordless Drill 18V Li-Ion develops a high-pitched whine after a few minutes of use.",
+    observed_symptoms=["high-pitched whine after a few minutes of use"],
+    expected_behavior=(
+        "Per kb-003 troubleshooting checklist, a non-defective drill should run quietly "
+        "and consistently after the standard checks (battery, lock-off, contacts, switch). "
+        "No KB article directly addresses an abnormal-sound symptom, so target behavior is "
+        "'no abnormal sounds' inferred from the absence of any documented exception."
+    ),
+    referenced_doc_ids=["kb-003", "kb-004"],
+    warranty_status="covered",
+    actual_behavior="High-pitched whine starts after a few minutes; happens consistently per user.",
+    reproduction_steps="<user's answer about every-time vs under-load>",
+    additional_context=(
+        "Resolution note from orders worker: order #87 stored the drill as product_id=9; "
+        "resolved via catalog to SKU PTDR018000 / Cordless Drill 18V Li-Ion to corroborate. "
+        "KB worker flagged that no help-center article directly covers a 'whine' symptom, "
+        "so the defect may not be documented yet — worth surfacing to whoever triages this."
+    ),
+    severity="medium",
+    category="warranty_claim",
+))
+```
+
+#### What this trace demonstrates
+
+1. **ID-to-name resolution inside the specialist** — orders specialist sees `product_id=9` in the raw item, explicitly resolves to "Cordless Drill 18V Li-Ion" via the catalog mapping, surfaces that reasoning in a "Resolution note:" line.
+
+2. **Reference-following inside the specialist** — kb specialist sees `kb-003` references warranty without explaining the claim process, proactively pulls `kb-004` in the same reply.
+
+3. **Honest reporting of gaps** — kb specialist explicitly says "no article matched the whine symptom directly" instead of forcing an irrelevant article to fit.
+
+4. **Cross-specialist synthesis at the lead** — the lead receives all three structured replies, identifies the remaining user-only fields, batches them into one short message, then submits the full structured ticket with the ID-resolution audit trail preserved in `additional_context`.
+
+This is the structural twin of: *"CB specialist fetches test case description, sees error code IDs in it, makes additional MCP calls to map IDs → names, corroborates against user-supplied names, and reports the full picture back to the lead."*

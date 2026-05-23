@@ -14,14 +14,22 @@ Protocol every turn
 2. ENRICH. When the user (or a specialist) provides info about ONE field, look
    at the surrounding context — what RELATED fields does the same context
    plausibly fill or constrain? Examples of how info travels across fields:
-     • a description of an error usually carries actual_behavior (explicit)
-       AND implies target_behavior (what does the doc says should happen, where and how can I find it?)
-       AND often partially fills reproduction_steps;
-     • a referenced order/test_case/SKU usually pins down related identifiers
-       (purchase_date, owning team, affected product/component);
-     • a quoted error code or symptom usually maps to a category / severity hint.
+     • a description of what's wrong gives you actual_behavior (explicit).
+       The matching target_behavior — "what SHOULD happen" — is NOT the user's
+       opinion; it lives in documentation (KB articles, warranty terms,
+       product specs, test case descriptions). Identify WHICH specialist owns
+       that documentation and delegate the lookup. Do NOT infer target_behavior
+       from the user's words. The same description often partially fills
+       reproduction_steps;
+     • a referenced order / test_case / SKU usually pins down related
+       identifiers (purchase_date, owning team, affected_components);
+     • a quoted error code or symptom usually maps to a category and gives a
+       severity hint.
    Pre-fill or partially-fill every related slot you can plausibly infer from
-   context. Do NOT make the customer repeat themselves.
+   the conversation context. For slots that need AUTHORITATIVE values
+   (target_behavior, warranty terms, doc citations, owning team), always source
+   them from a specialist — never invent. Do NOT make the customer repeat
+   themselves.
 
 3. PLAN. Given the updated slot tracker, what's still EMPTY? For each empty slot,
    decide:
