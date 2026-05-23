@@ -29,7 +29,6 @@ from starlette.staticfiles import StaticFiles
 from app.agent import build_agent, build_models
 from app.data_loader import load_all
 from app.streaming import event, iter_message_events
-from app.tools import ALL_TOOLS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,8 +47,7 @@ async def lifespan(app: Starlette):
     app.state.app_data = app_data
     app.state.agent = agent
     app.state.ready = True
-    logger.info("✅ Agent ready (%d tools, %d KB articles)",
-                len(ALL_TOOLS), len(app_data.kb_articles))
+    logger.info("✅ Lead agent ready (%d KB articles)", len(app_data.kb_articles))
 
     try:
         yield

@@ -1,43 +1,43 @@
-"""Delegate tools — the lead's view of each subagent.
+"""Delegate tools — the lead's view of each specialist subagent.
 
-Each delegate wraps a subagent.invoke(...) call and returns ONLY the final
-string. The subagent's intermediate tool calls and tool results never enter
-the lead's message history; that's the context-isolation property.
+Each delegate is built dynamically at startup. Its input schema (the Pydantic
+Query class) and docstring are derived from the subagent's actual tools, so
+adding a tool to a subagent automatically updates the lead's view — no prose
+edits required.
 
-The kb delegate returns a `Command` that also propagates extracted doc-ids
-into the lead's state, so the lead can populate `referenced_doc_ids` in the
-support ticket.
+Pattern:
+  1. `build_delegates(orders_sub, catalog_sub, kb_sub)` is called from
+     `app/agents/lead.py` once subagents are constructed.
+  2. For each subagent we build a `Query` Pydantic model whose fields are
+     `goal` + the union of every non-injected arg across the subagent's tools.
+  3. We wrap that with `@tool(args_schema=Query)`; the @tool body unpacks the
+     query, formats a natural-language message, and invokes the subagent.
+
+The kb delegate additionally returns a `Command` that propagates extracted
+doc-ids into the lead's state so the `validate_response` middleware can
+ground-check the lead's reply.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Annotated
+from typing import Annotated, Any
 
 from langchain.tools import InjectedToolCallId, tool
 from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.types import Command
 
-from app.agents.subagents import build_subagents
-
-_orders = None
-_catalog = None
-_kb = None
+from app.agents.auto_query import (
+    build_delegate_docstring,
+    build_query_model,
+    format_query_message,
+)
 
 _DOC_TAG = re.compile(r"\[([a-zA-Z0-9_\-]+)\]")
 
 
-def init_delegates(nano_model) -> None:
-    """Wire subagent instances into module globals so the @tool wrappers can call them.
-
-    Called once from build_lead. Keeps the subagents importable without
-    needing the LLM creds at import time.
-    """
-    global _orders, _catalog, _kb
-    _orders, _catalog, _kb = build_subagents(nano_model)
-
-
-def _final_text(response) -> str:
+def _final_text(response: Any) -> str:
+    """Extract the final assistant text from a subagent invoke response."""
     msgs = response.get("messages", []) if isinstance(response, dict) else []
     if not msgs:
         return ""
@@ -46,7 +46,7 @@ def _final_text(response) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
+        parts: list[str] = []
         for block in content:
             if isinstance(block, dict):
                 t = block.get("text") or block.get("delta") or ""
@@ -58,57 +58,76 @@ def _final_text(response) -> str:
     return ""
 
 
-@tool
-async def ask_orders_specialist(question: str) -> str:
-    """Ask the ORDERS expert. Use for ALL order-related questions:
-    order lookup, listing a customer's recent orders, status checks,
-    return eligibility, initiating a return.
+_ORDERS_PURPOSE = (
+    "Delegate to the orders worker. It reasons over Zava order records (orders, "
+    "items, statuses, return-eligibility windows) using its own toolset. The "
+    "worker is READ-ONLY — destructive operations (initiate_return) are at the "
+    "lead level, gated by user confirmation."
+)
 
-    Provide a SELF-CONTAINED question that includes every known id
-    (customer_id, order_id, item_index). The specialist has no memory of
-    earlier questions. Returns a concise factual answer, or "MISSING: <field>"
-    if a required id is absent.
+_CATALOG_PURPOSE = (
+    "Delegate to the catalog worker. It searches the Zava product catalog and "
+    "looks up warranty terms by SKU/category using its own toolset."
+)
+
+_KB_PURPOSE = (
+    "Delegate to the knowledge-base worker. It searches Zava's help-center "
+    "articles. Replies preserve [kb-XXX] citation tags which the lead can "
+    "use to populate `referenced_doc_ids` on a ticket."
+)
+
+
+def build_delegates(orders_sub, catalog_sub, kb_sub):
+    """Return [ask_orders_specialist, ask_catalog_specialist, ask_kb_specialist].
+
+    Called once at startup after subagents are constructed. Each delegate's
+    input schema and docstring are computed from its subagent's tools.
     """
-    if _orders is None:
-        return "ERROR: orders specialist not initialised."
-    response = await _orders.ainvoke({"messages": [HumanMessage(content=question)]})
-    return _final_text(response)
 
+    # --- Orders delegate ---
+    OrdersQuery = build_query_model("Orders", orders_sub)
 
-@tool
-async def ask_catalog_specialist(question: str) -> str:
-    """Ask the CATALOG expert. Use for product search and warranty terms.
+    @tool("ask_orders_specialist", args_schema=OrdersQuery)
+    async def ask_orders_specialist(**query) -> str:  # noqa: D401
+        """Auto-generated; replaced below."""
+        msg = format_query_message(query)
+        response = await orders_sub.ainvoke({"messages": [HumanMessage(content=msg)]})
+        return _final_text(response)
 
-    Provide a SELF-CONTAINED question. Include the SKU when known. Returns a
-    concise factual answer, or "MISSING: sku" if a SKU is needed but missing.
-    """
-    if _catalog is None:
-        return "ERROR: catalog specialist not initialised."
-    response = await _catalog.ainvoke({"messages": [HumanMessage(content=question)]})
-    return _final_text(response)
+    ask_orders_specialist.description = build_delegate_docstring(_ORDERS_PURPOSE, orders_sub)
 
+    # --- Catalog delegate ---
+    CatalogQuery = build_query_model("Catalog", catalog_sub)
 
-@tool
-async def ask_kb_specialist(
-    question: str,
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> Command:
-    """Ask the KNOWLEDGE BASE expert. Use for help-center policies and procedures.
+    @tool("ask_catalog_specialist", args_schema=CatalogQuery)
+    async def ask_catalog_specialist(**query) -> str:  # noqa: D401
+        """Auto-generated; replaced below."""
+        msg = format_query_message(query)
+        response = await catalog_sub.ainvoke({"messages": [HumanMessage(content=msg)]})
+        return _final_text(response)
 
-    Returns the relevant article excerpts with [doc_id] tags preserved
-    (e.g. [kb-001], [kb-009]). The doc ids will be available for you to
-    populate `referenced_doc_ids` when filing a ticket.
-    """
-    if _kb is None:
+    ask_catalog_specialist.description = build_delegate_docstring(_CATALOG_PURPOSE, catalog_sub)
+
+    # --- KB delegate (returns Command to update lead state with retrieved doc ids) ---
+    KbQuery = build_query_model("Kb", kb_sub)
+
+    @tool("ask_kb_specialist", args_schema=KbQuery)
+    async def ask_kb_specialist(
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        **query,
+    ) -> Command:  # noqa: D401
+        """Auto-generated; replaced below."""
+        msg = format_query_message(query)
+        response = await kb_sub.ainvoke({"messages": [HumanMessage(content=msg)]})
+        text = _final_text(response)
+        doc_ids = sorted(set(_DOC_TAG.findall(text)))
         return Command(
-            update={"messages": [ToolMessage("ERROR: kb specialist not initialised.", tool_call_id=tool_call_id)]}
+            update={
+                "last_retrieved_docs": doc_ids,
+                "messages": [ToolMessage(text, tool_call_id=tool_call_id)],
+            }
         )
-    response = await _kb.ainvoke({"messages": [HumanMessage(content=question)]})
-    text = _final_text(response)
-    doc_ids = sorted(set(_DOC_TAG.findall(text)))
-    return Command(
-        update={
-            "last_retrieved_docs": doc_ids,
-            "messages": [ToolMessage(text, tool_call_id=tool_call_id)],
-        }
-    )
+
+    ask_kb_specialist.description = build_delegate_docstring(_KB_PURPOSE, kb_sub)
+
+    return ask_orders_specialist, ask_catalog_specialist, ask_kb_specialist

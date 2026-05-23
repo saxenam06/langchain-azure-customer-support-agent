@@ -1,15 +1,12 @@
 """Build the lead (orchestrator) agent.
 
-The lead is a single create_agent that holds the user-facing conversation.
-Its tools are the three delegate wrappers (one per specialist domain) plus
-a handful of direct tools (customer lookup, ticket creation, csat, escalate).
+The lead owns the user conversation. Its tools are the three dynamically-
+built delegate wrappers (whose input schemas are derived from each
+subagent's tools) plus the lead-level direct tools (customer lookup,
+initiate_return, ticket creation, csat, escalate).
 
-Middleware stack:
-  refine_query                  — input cleanup (nano)
-  validate_response             — post-call groundedness on every reply
-  ToolCallLimitMiddleware x 3   — bound each delegate to <=3 calls per turn
-  HumanInTheLoopMiddleware      — confirm before destructive actions
-  SummarizationMiddleware       — condense long histories
+All destructive actions are at the lead level and gated by
+HumanInTheLoopMiddleware so the customer confirms before they run.
 """
 
 from __future__ import annotations
@@ -24,15 +21,12 @@ from langchain.agents.middleware import (
 )
 from langgraph.checkpoint.memory import InMemorySaver
 
+from app.agents.subagents import build_subagents
 from app.middleware.refine import make_refine_query
 from app.middleware.validate import make_validate_response
 from app.state import SupportState
-from app.tools.delegates import (
-    ask_catalog_specialist,
-    ask_kb_specialist,
-    ask_orders_specialist,
-    init_delegates,
-)
+from app.tools.delegates import build_delegates
+from app.tools.orders import initiate_return
 from app.tools.tickets import create_support_ticket, request_csat
 from app.tools.workflow import escalate_to_human, lookup_customer_by_email
 
@@ -44,8 +38,9 @@ def _load_prompt(name: str) -> str:
 
 
 def build_lead(main_model, nano_model):
-    """Compile the lead agent + initialise the subagents it delegates to."""
-    init_delegates(nano_model)
+    """Compile the lead agent + its specialist subagents + dynamic delegates."""
+    orders_sub, catalog_sub, kb_sub = build_subagents(nano_model)
+    ask_orders, ask_catalog, ask_kb = build_delegates(orders_sub, catalog_sub, kb_sub)
 
     refine_query = make_refine_query(nano_model)
     validate_response = make_validate_response(nano_model)
@@ -54,10 +49,12 @@ def build_lead(main_model, nano_model):
     return create_agent(
         model=main_model,
         tools=[
-            ask_orders_specialist,
-            ask_catalog_specialist,
-            ask_kb_specialist,
+            ask_orders,
+            ask_catalog,
+            ask_kb,
             lookup_customer_by_email,
+            # destructive actions — all gated by HumanInTheLoopMiddleware below
+            initiate_return,
             create_support_ticket,
             request_csat,
             escalate_to_human,
@@ -72,6 +69,7 @@ def build_lead(main_model, nano_model):
             ToolCallLimitMiddleware(tool_name="ask_kb_specialist", run_limit=3),
             HumanInTheLoopMiddleware(
                 interrupt_on={
+                    "initiate_return": True,
                     "create_support_ticket": True,
                     "escalate_to_human": True,
                     "request_csat": True,
